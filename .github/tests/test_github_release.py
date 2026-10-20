@@ -1,6 +1,8 @@
 """GitHub Release wheel 产物保存测试；当前工作流不包含 Release API 发布任务。"""
 
+import base64
 from fnmatch import fnmatchcase
+import hashlib
 import importlib.util
 import json
 import os
@@ -15,6 +17,9 @@ from unittest.mock import Mock
 import pytest
 import requests
 import yaml
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from packaging.requirements import Requirement
 from packaging.version import Version
 
@@ -121,7 +126,10 @@ def test_workflow_and_jobs_only_require_read_access(workflow):
 def test_post_job_downloads_current_release_data_and_limits_secret_scope(workflow):
     job = workflow["jobs"]["post-release-data"]
     assert set(job["needs"]) == {"prepare-matrix", "update-metadata"}
-    assert workflow["on"]["workflow_call"]["secrets"]["data_token"]["required"] == "true"
+    secrets = workflow["on"]["workflow_call"]["secrets"]
+    api_secrets = ("data_token",)
+    assert not {"client_private_key_b64", "open_api_base_url", "open_api_client_id", "server_public_key_b64"} & secrets.keys()
+    assert all(secrets[name]["required"] == "true" for name in api_secrets)
     download, checkout, setup, install, post = job["steps"]
     assert download["uses"] == "actions/download-artifact@v4"
     assert download["with"] == {
@@ -136,11 +144,11 @@ def test_post_job_downloads_current_release_data_and_limits_secret_scope(workflo
     }
     assert setup["uses"] == "actions/setup-python@v5"
     assert setup["with"]["python-version"] == "3.12"
-    assert install["run"] == "python -m pip install --no-input requests"
+    assert install["run"] == "python -m pip install --no-input requests cryptography"
     assert post["run"] == "python ci-template/.github/scripts/post_data.py --input-dir release-data"
     assert post["env"] == {
         "PACKAGE_NAME": "${{ needs.prepare-matrix.outputs.package_name }}",
-        "DATA_TOKEN": "${{ secrets.data_token }}",
+        "CLIENT_PRIVATE_KEY_B64": "${{ secrets.data_token }}",
     }
     assert "env" not in job
     assert "continue-on-error" not in job
@@ -150,7 +158,7 @@ def test_post_job_downloads_current_release_data_and_limits_secret_scope(workflo
     for job_data in workflow["jobs"].values():
         for step in job_data["steps"]:
             if step is not post:
-                assert "secrets.data_token" not in str(step)
+                assert all(f"secrets.{name}" not in str(step) for name in api_secrets)
 
 
 def test_post_download_pattern_matches_all_current_matrix_records(workflow):
@@ -193,7 +201,7 @@ def test_post_gate_requires_metadata_success(workflow, cancelled, release, resul
     assert eval(expression.replace("&&", "and"), {"__builtins__": {}}) is expected
 
 
-def post_response(status=200, url="https://admin.flytiger-eco.com/api/ecological/artifact/saveSingle",
+def post_response(status=200, url="https://api.example.test/open/flyingTiger/synchronize/artifact/save",
                   method="POST", location=None, content_type="application/json"):
     response = requests.Response()
     response.status_code = status
@@ -202,7 +210,7 @@ def post_response(status=200, url="https://admin.flytiger-eco.com/api/ecological
     if location is not None:
         response.headers["Location"] = location
     response._content = b'{}'
-    response.request = requests.Request(method, url, headers={"Authorization": "test-data-token"}).prepare()
+    response.request = requests.Request(method, url).prepare()
     return response
 
 
@@ -218,15 +226,107 @@ def post_script(monkeypatch):
     return module
 
 
+@pytest.fixture(scope="module")
+def api_keys():
+    return tuple(rsa.generate_private_key(public_exponent=65537, key_size=2048) for _ in range(2))
+
+
+def set_open_api_value(post_script, monkeypatch, name, value):
+    if name != "CLIENT_PRIVATE_KEY_B64":
+        monkeypatch.setattr(post_script, name, value)
+    elif value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+
 @pytest.fixture
-def post_workspace(monkeypatch):
+def open_api_env(post_script, monkeypatch, api_keys):
+    server_key, client_key = api_keys
+    values = {
+        "OPEN_API_BASE_URL": "https://api.example.test",
+        "OPEN_API_CLIENT_ID": "test-client",
+        "SERVER_PUBLIC_KEY_B64": base64.b64encode(server_key.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo,
+        )).decode("ascii"),
+        "CLIENT_PRIVATE_KEY_B64": base64.b64encode(client_key.private_bytes(
+            serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
+        )).decode("ascii"),
+    }
+    for name, value in values.items():
+        set_open_api_value(post_script, monkeypatch, name, value)
+        if name != "CLIENT_PRIVATE_KEY_B64":
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("DATA_TOKEN", raising=False)
+    return values
+
+
+@pytest.fixture
+def api_client(post_script, open_api_env):
+    return post_script.OpenApiClient(post_script.OpenApiConfig.from_env())
+
+
+@pytest.fixture
+def decode_request(api_keys):
+    """使用独立密钥验签、解密实际请求体，不复用生产代码的加密辅助函数。"""
+    server_key, client_key = api_keys
+
+    def decode(call):
+        body = call.kwargs["data"]
+        headers = call.kwargs["headers"]
+        assert isinstance(body, bytes)
+        assert "json" not in call.kwargs
+        signing_text = "\n".join((
+            headers["X-Open-Client"], "POST", "/open/flyingTiger/synchronize/artifact/save",
+            headers["X-Open-Timestamp"], hashlib.sha256(body).hexdigest(),
+        ))
+        client_key.public_key().verify(
+            base64.b64decode(headers["X-Open-Sign"]), signing_text.encode("utf-8"),
+            padding.PKCS1v15(), hashes.SHA256(),
+        )
+        envelope = json.loads(body)
+        assert set(envelope) == {"encKey", "iv", "cipher"}
+        aes_key = server_key.decrypt(
+            base64.b64decode(envelope["encKey"]),
+            padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None),
+        )
+        iv = base64.b64decode(envelope["iv"])
+        assert len(aes_key) == 32 and len(iv) == 12
+        return json.loads(AESGCM(aes_key).decrypt(iv, base64.b64decode(envelope["cipher"]), None))
+
+    return decode
+
+
+@pytest.fixture
+def post_workspace(monkeypatch, open_api_env):
     with tempfile.TemporaryDirectory(prefix=".post-data-test-", dir=CI_ROOT) as directory:
         root = Path(directory)
         monkeypatch.chdir(root)
         monkeypatch.setenv("PACKAGE_NAME", "demo-package")
-        monkeypatch.setenv("DATA_TOKEN", "test-data-token")
         (root / "release-data").mkdir()
         yield root
+
+
+@pytest.fixture
+def run_post_cli(post_workspace, post_script, monkeypatch):
+    """临时副本仅注入三个公共常量，保留真实 CLI 入口和私钥读取逻辑。"""
+    source = (CI_ROOT / "scripts/post_data.py").read_text(encoding="utf-8")
+    names = ("OPEN_API_BASE_URL", "OPEN_API_CLIENT_ID", "SERVER_PUBLIC_KEY_B64")
+    lines = []
+    for line in source.splitlines():
+        for name in names:
+            if line.startswith(f"{name} = "):
+                line = f"{name} = {getattr(post_script, name)!r}"
+                break
+        lines.append(line)
+    script = post_workspace / "post_data.py"
+    script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def run():
+        monkeypatch.setattr(sys, "argv", [str(script), "--input-dir", "release-data"])
+        return runpy.run_path(str(script), run_name="__main__")
+
+    return run
 
 
 @pytest.fixture
@@ -242,15 +342,17 @@ def test_post_payload_normalizes_fields_and_derives_versions_and_commands(post_s
     original = json.dumps(release_record)
     payload = post_script.build_payload(release_record, "demo_package")
     assert payload == {
-        "artifactName": "demo_package", "item": "demo_package", "businessType": "PYPI",
-        "artifactType": "", "sdkVersion": "2.2.0", "artifactVersion": "v1.0.0",
-        "subVersion": "v0.3.0", "osTypeList": ["ubuntu24"], "cudaVersion": "13.0",
-        "framework": "torch2.10.0", "python": "3.12",
-        "idempotentKey": "76a4f9f6aed64aa45050779c753ddcd7",
-        "cmdLine": "pip install demo_package==v1.0.0 -i "
-                   "https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple",
-        "specificLine": "pip install demo_package==v1.0.0+v0.3.0.ppu2.2.0 -i "
-                        "https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple",
+        "artifactName": "demo_package", "businessType": "PIP",
+        "idempotentKey": "0e2dc2d87b8fe98bf0090163f0fdcac0",
+        "attributes": {
+            "item": ["demo_package"], "type": [""], "sdk_version": ["2.2.0"],
+            "version": ["v1.0.0"], "sub_version": ["v0.3.0"], "os": ["ubuntu24"],
+            "cuda": ["13.0"], "framework": ["torch2.10.0"], "python": ["3.12"],
+            "cmd_line": ["pip install demo_package==v1.0.0 -i "
+                         "https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"],
+            "specific_line": ["pip install demo_package==v1.0.0+v0.3.0.ppu2.2.0 -i "
+                              "https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"],
+        },
     }
     assert json.dumps(release_record) == original
 
@@ -259,24 +361,26 @@ def test_post_derived_fields_cannot_be_overridden_by_extra_record_fields(post_sc
     expected = post_script.build_payload(release_record, "demo_package")
     release_record.update(idempotentKey="manual-key", subVersion="wrong", artifactVersion="wrong",
                           cmdLine=[], specificLine="wrong", artifactType="other",
-                          businessType="other", cudaVersion="12.8", unrelated="ignored")
+                          businessType="other", cudaVersion="12.8", unrelated="ignored",
+                          attributes={"item": ["other"], "sdk_version": ["9.9.9"],
+                                      "cmd_line": ["wrong"], "specific_line": ["wrong"]})
     assert post_script.build_payload(release_record, "demo_package") == expected
 
 
-@pytest.mark.parametrize("source_field,payload_field,raw,expected", [
-    ("sdkVersion", "sdkVersion", "v2.2.0", "2.2.0"),
-    ("sdkVersion", "sdkVersion", "SAIL2.1.0", "2.1.0"),
-    ("sdkVersion", "sdkVersion", "PPUv2.2.0", "2.2.0"),
-    ("osTypeList", "osTypeList", "ubuntu2404", ["ubuntu24"]),
-    ("osTypeList", "osTypeList", "Ubuntu24.04", ["ubuntu24"]),
-    ("osTypeList", "osTypeList", "ubuntu2204", ["ubuntu22"]),
-    ("osTypeList", "osTypeList", "Ubuntu22.04", ["ubuntu22"]),
-    ("osTypeList", "osTypeList", "ubuntu2004", ["ubuntu20"]),
-    ("osTypeList", "osTypeList", "Ubuntu20.04", ["ubuntu20"]),
-    ("osTypeList", "osTypeList", "AliOS7U2", ["alios7u2"]),
-    ("runtimeVersion", "cudaVersion", "12.8.0", "12.8"),
-    ("runtimeVersion", "cudaVersion", "CUDA13.0.0", "13.0"),
-    ("runtimeVersion", "cudaVersion", "cu13.2.0", "13.2"),
+@pytest.mark.parametrize("source_field,attribute,raw,expected", [
+    ("sdkVersion", "sdk_version", "v2.2.0", "2.2.0"),
+    ("sdkVersion", "sdk_version", "SAIL2.1.0", "2.1.0"),
+    ("sdkVersion", "sdk_version", "PPUv2.2.0", "2.2.0"),
+    ("osTypeList", "os", "ubuntu2404", "ubuntu24"),
+    ("osTypeList", "os", "Ubuntu24.04", "ubuntu24"),
+    ("osTypeList", "os", "ubuntu2204", "ubuntu22"),
+    ("osTypeList", "os", "Ubuntu22.04", "ubuntu22"),
+    ("osTypeList", "os", "ubuntu2004", "ubuntu20"),
+    ("osTypeList", "os", "Ubuntu20.04", "ubuntu20"),
+    ("osTypeList", "os", "AliOS7U2", "alios7u2"),
+    ("runtimeVersion", "cuda", "12.8.0", "12.8"),
+    ("runtimeVersion", "cuda", "CUDA13.0.0", "13.0"),
+    ("runtimeVersion", "cuda", "cu13.2.0", "13.2"),
     ("framework", "framework", "", ""),
     ("framework", "framework", "2.13.0", "torch2.13.0"),
     ("framework", "framework", "TORCH2.10.0", "torch2.10.0"),
@@ -285,10 +389,11 @@ def test_post_derived_fields_cannot_be_overridden_by_extra_record_fields(post_sc
     ("python", "python", "PY310", "3.10"), ("python", "python", "CP38", "3.8"),
     ("python", "python", "3.12", "3.12"),
 ])
-def test_post_field_normalization(post_script, release_record, source_field, payload_field, raw, expected):
+def test_post_field_normalization(post_script, release_record, source_field, attribute, raw, expected):
     payload = post_script.build_payload({**release_record, source_field: raw}, "demo_package")
-    assert payload[payload_field] == expected
-    assert "runtimeVersion" not in payload
+    assert payload["attributes"][attribute] == [expected]
+    assert source_field not in payload
+    assert "runtimeVersion" not in payload["attributes"]
 
 
 @pytest.mark.parametrize("runtime", ["", "2", "3", "HGGCRT3", "13.0", "13.0.0.1"])
@@ -303,11 +408,18 @@ def test_post_rejects_unsupported_cuda_formats_before_any_request(
     post_script.requests.post.assert_not_called()
 
 
-def test_post_idempotent_key_is_stable_across_order_and_normalized_prefixes(post_script, release_record):
+@pytest.mark.parametrize("os_type,alias", [
+    ("ubuntu2404", "Ubuntu24.04"), ("ubuntu2204", "Ubuntu22.04"),
+    ("ubuntu2004", "Ubuntu20.04"), ("alios7u2", "AliOS7U2"),
+])
+def test_post_idempotent_key_is_stable_across_order_and_normalized_prefixes(
+    post_script, release_record, os_type, alias
+):
+    release_record["osTypeList"] = os_type
     expected = post_script.build_payload(release_record, "demo_package")["idempotentKey"]
     reordered = dict(reversed(list(release_record.items())))
     reordered.update(sdkVersion="PPUv2.2.0", runtimeVersion="CUDA13.0.0",
-                     framework="TORCH2.10.0", python="CP312")
+                     framework="TORCH2.10.0", python="CP312", osTypeList=alias)
     assert post_script.build_payload(reordered, "demo_package")["idempotentKey"] == expected
     assert post_script.build_payload(release_record, "demo_package")["idempotentKey"] == expected
 
@@ -327,7 +439,9 @@ def test_post_idempotent_keys_distinguish_all_release_dimensions(post_script, re
 
 
 @pytest.mark.parametrize("status", [200, 201, 204])
-def test_post_main_sends_one_request_per_json(post_script, post_workspace, release_record, capsys, status):
+def test_post_main_sends_one_request_per_json(
+    post_script, post_workspace, release_record, capsys, status, decode_request, open_api_env
+):
     post_script.requests.post.return_value.status_code = status
     files = []
     for index, sdk in enumerate(("2.1.0", "2.2.0")):
@@ -338,20 +452,22 @@ def test_post_main_sends_one_request_per_json(post_script, post_workspace, relea
     post_script.main(["--input-dir", "release-data"])
     calls = post_script.requests.post.call_args_list
     assert len(calls) == 2
-    assert [call.kwargs["json"]["sdkVersion"] for call in calls] == ["2.1.0", "2.2.0"]
+    assert [decode_request(call)["attributes"]["sdk_version"] for call in calls] == [["2.1.0"], ["2.2.0"]]
     for call in calls:
-        assert call.args == ("https://admin.flytiger-eco.com/api/ecological/artifact/saveSingle",)
-        assert call.kwargs["headers"] == {
-            "Content-Type": "application/json", "maskValue": "true", "Authorization": "test-data-token",
-        }
-        assert call.kwargs["allow_redirects"] is True
-        assert callable(call.kwargs["hooks"]["response"])
+        assert call.args == ("https://api.example.test/open/flyingTiger/synchronize/artifact/save",)
+        headers = call.kwargs["headers"]
+        assert set(headers) == {"Content-Type", "X-Open-Client", "X-Open-Timestamp", "X-Open-Sign"}
+        assert headers["Content-Type"] == "application/json"
+        assert headers["X-Open-Client"] == "test-client"
+        assert headers["X-Open-Timestamp"].isdigit()
+        assert call.kwargs["allow_redirects"] is False
         assert call.kwargs["timeout"] == (30, 300)
         assert "auth" not in call.kwargs
     assert [path.read_bytes() for path in files] == originals
     output = capsys.readouterr()
     assert "共推送 2 条发布数据" in output.out
-    assert "test-data-token" not in output.out + output.err
+    for name in ("SERVER_PUBLIC_KEY_B64", "CLIENT_PRIVATE_KEY_B64"):
+        assert open_api_env[name] not in output.out + output.err
 
 
 @pytest.mark.parametrize("version_source", ["repository", "override_branch", "override_rc_tag"])
@@ -364,7 +480,8 @@ def test_post_main_sends_one_request_per_json(post_script, post_workspace, relea
     ("1.0.0+build_1", "1.0.0", "build_1", "1.0.0+build_1.ppu2.2.0"),
 ])
 def test_generated_matrix_json_reaches_post_cli(
-    workflow, post_script, post_workspace, monkeypatch, tag, version, sub_version, release_version, version_source, prefix
+    workflow, post_script, post_workspace, monkeypatch, tag, version, sub_version,
+    release_version, version_source, prefix, decode_request, run_post_cli
 ):
     inputs = {
         "package_name": "demo_package", "sdk_versions": '["2.2.0"]',
@@ -402,22 +519,26 @@ def test_generated_matrix_json_reaches_post_cli(
         assert "hggcrtVersion" not in record
         assert record["python"] == "312"
         assert record["tag"] == tag
-    monkeypatch.setattr(sys, "argv", ["post_data.py", "--input-dir", "release-data"])
-    runpy.run_path(str(CI_ROOT / "scripts/post_data.py"), run_name="__main__")
-    payloads = [call.kwargs["json"] for call in post_script.requests.post.call_args_list]
+    run_post_cli()
+    payloads = [decode_request(call) for call in post_script.requests.post.call_args_list]
     assert len(payloads) == 2
-    assert [data["framework"] for data in payloads] == ["torch2.10.0", "torch2.13.0"]
+    assert [data["attributes"]["framework"] for data in payloads] == [["torch2.10.0"], ["torch2.13.0"]]
     assert len({data["idempotentKey"] for data in payloads}) == 2
     for data, matrix in zip(payloads, matrices):
-        assert data["artifactName"] == data["item"] == "demo_package"
-        assert data["python"] == "3.12" and data["osTypeList"] == ["ubuntu24"]
-        assert data["cudaVersion"] == "13.0" and data["sdkVersion"] == "2.2.0"
-        assert "runtimeVersion" not in data
-        assert data["artifactVersion"] == version and data["subVersion"] == sub_version
-        for field, expected_version in (("cmdLine", version), ("specificLine", release_version)):
-            args = shlex.split(data[field])
+        assert set(data) == {"artifactName", "businessType", "idempotentKey", "attributes"}
+        assert data["artifactName"] == "demo_package" and data["businessType"] == "PIP"
+        attributes = data["attributes"]
+        assert all(isinstance(value, list) and len(value) == 1 and isinstance(value[0], str)
+                   for value in attributes.values())
+        assert attributes["item"] == ["demo_package"] and attributes["type"] == [""]
+        assert attributes["python"] == ["3.12"] and attributes["os"] == ["ubuntu24"]
+        assert attributes["cuda"] == ["13.0"] and attributes["sdk_version"] == ["2.2.0"]
+        assert "runtimeVersion" not in attributes
+        assert attributes["version"] == [version] and attributes["sub_version"] == [sub_version]
+        for field, expected_version in (("cmd_line", version), ("specific_line", release_version)):
+            args = shlex.split(attributes[field][0])
             assert args == ["pip", "install", f"demo_package=={expected_version}", "-i",
-                            "https://download.t-head.cn/artifactory/api/pypi/pypi_index/simple"]
+                            "https://pkg.flytiger-eco.com/artifactory/api/pypi/pypi_index/simple"]
             # 安装约束必须能选中矩阵实际发布的版本，防止再次重复添加 v。
             assert Requirement(args[2]).specifier.contains(Version(matrix["release_version"]))
 
@@ -435,20 +556,22 @@ def test_post_http_failure_stops_without_retry(post_script, post_workspace, rele
 
 
 @pytest.mark.parametrize("error_type", ["Timeout", "ConnectionError", "InvalidHeader"])
-def test_post_network_errors_do_not_expose_token(post_script, post_workspace, release_record, monkeypatch, capsys, error_type):
+def test_post_network_errors_do_not_expose_keys(
+    post_script, post_workspace, release_record, capsys, error_type, open_api_env, run_post_cli
+):
     (post_workspace / "release-data/release-0.json").write_text(json.dumps(release_record))
-    post_script.requests.post.side_effect = getattr(post_script.requests.exceptions, error_type)("test-data-token")
-    monkeypatch.setattr(sys, "argv", ["post_data.py", "--input-dir", "release-data"])
+    secret = open_api_env["CLIENT_PRIVATE_KEY_B64"]
+    post_script.requests.post.side_effect = getattr(post_script.requests.exceptions, error_type)(secret)
     with pytest.raises(SystemExit, match=f"推送发布数据失败.*{error_type}") as error:
-        runpy.run_path(str(CI_ROOT / "scripts/post_data.py"), run_name="__main__")
+        run_post_cli()
     output = capsys.readouterr()
-    assert "test-data-token" not in str(error.value) + output.out + output.err
+    assert secret not in str(error.value) + output.out + output.err
     post_script.requests.post.assert_called_once()
 
 
 @pytest.fixture
 def redirect_transport(post_script, monkeypatch, post_workspace):
-    """只替换网络发送层，真实执行 requests 的跳转、方法转换和认证头处理。"""
+    """只替换网络发送层，确认 requests 不会跟随重定向。"""
     responses, sent = [], []
 
     def send(adapter, request, **kwargs):
@@ -468,119 +591,141 @@ def redirect_transport(post_script, monkeypatch, post_workspace):
     return responses, sent
 
 
-@pytest.mark.parametrize("status,method", [(301, "GET"), (302, "GET"), (303, "GET"), (307, "POST"), (308, "POST")])
-def test_redirects_follow_requests_method_rules_and_log_hops(post_script, redirect_transport, capsys, status, method):
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+@pytest.mark.parametrize("location", [
+    "/api/final?ticket=hidden-query",
+    "https://login.example.test/login?ticket=hidden-query",
+    "http://example.test/api?ticket=hidden-query",
+])
+def test_signed_requests_never_follow_redirects(api_client, redirect_transport, capsys, status, location):
     responses, sent = redirect_transport
-    responses.extend([{"status": status, "location": "/api/final?ticket=hidden-query"}, {}])
-    post_script.post_payload({"item": "demo_package"}, "test-data-token")
-    assert [request.method for request in sent] == ["POST", method]
-    assert sent[1].headers["Authorization"] == "test-data-token"
-    if method == "POST":
-        assert sent[1].body == sent[0].body
-    else:
-        assert sent[1].body is None
-    output = capsys.readouterr().out
-    assert output.count("HTTP 诊断：") == 2
-    assert f'"status": {status}' in output
-    assert f'"method": "{method}"' in output
-    assert '"location": "https://admin.flytiger-eco.com/api/final"' in output
-    assert "自动跳转次数：1；最终 HTTP 200" in output
-    assert ("请求不再是 POST" in output) == (method == "GET")
-    assert "test-data-token" not in output and "hidden-query" not in output
-
-
-def test_cross_host_redirect_does_not_forward_authorization(post_script, redirect_transport, capsys):
-    responses, sent = redirect_transport
-    responses.extend([{"status": 302, "location": "https://login.example.test/api?token=hidden-query"}, {}])
-    post_script.post_payload({}, "test-data-token")
-    assert sent[0].headers["Authorization"] == "test-data-token"
-    assert "Authorization" not in sent[1].headers
-    output = capsys.readouterr().out
-    assert '"authorization_present": true' in output
-    assert '"authorization_present": false' in output
-    assert "https://login.example.test/api" in output
-    assert "test-data-token" not in output and "hidden-query" not in output
+    responses.append({"status": status, "location": location})
+    with pytest.raises(ValueError, match=f"HTTP {status}"):
+        api_client.save_artifact({"item": "demo_package"})
+    assert len(sent) == 1
+    assert sent[0].method == "POST"
+    assert sent[0].headers["X-Open-Client"] == "test-client"
+    assert "Authorization" not in sent[0].headers
+    assert "hidden-query" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("content_type", ["text/html; charset=UTF-8", "application/xhtml+xml"])
-def test_redirect_to_html_is_not_reported_as_success(post_script, redirect_transport, capsys, content_type):
-    responses, sent = redirect_transport
-    responses.extend([{"status": 302, "location": "/login"}, {"content_type": content_type}])
+def test_html_is_not_reported_as_success(post_script, api_client, capsys, content_type):
+    post_script.requests.post.return_value = post_response(content_type=content_type)
     with pytest.raises(ValueError, match="可能进入登录页面"):
-        post_script.post_payload({}, "test-data-token")
-    assert len(sent) == 2
-    assert '"status": 200' in capsys.readouterr().out
+        api_client.save_artifact({})
+    post_script.requests.post.assert_called_once()
+    assert "HTTP 200" in capsys.readouterr().out
 
 
-def test_redirect_to_http_is_blocked_before_sending(post_script, redirect_transport, capsys):
-    responses, sent = redirect_transport
-    responses.append({"status": 307, "location": "http://example.test/api?token=hidden-query"})
-    with pytest.raises(ValueError, match="非 HTTPS"):
-        post_script.post_payload({}, "test-data-token")
-    assert len(sent) == 1
-    output = capsys.readouterr().out
-    assert "http://example.test/api" in output and "hidden-query" not in output
-
-
-def test_final_redirect_error_logs_chain_before_failing(post_script, redirect_transport, capsys):
-    responses, sent = redirect_transport
-    responses.extend([{"status": 302, "location": "/login"}, {"status": 403}])
-    with pytest.raises(ValueError, match="HTTP 403"):
-        post_script.post_payload({}, "test-data-token")
-    assert len(sent) == 2
-    output = capsys.readouterr().out
-    assert output.count("HTTP 诊断：") == 2
-    assert "自动跳转次数：1；最终 HTTP 403" in output
-
-
-def test_redirect_timeout_keeps_previous_hop_diagnostics(post_script, redirect_transport, capsys):
-    responses, sent = redirect_transport
-    responses.extend([{"status": 302, "location": "/login?token=hidden-query"},
-                      requests.Timeout("test-data-token")])
-    with pytest.raises(ValueError, match="Timeout") as error:
-        post_script.post_payload({}, "test-data-token")
-    assert len(sent) == 2
-    output = capsys.readouterr().out
-    assert '"status": 302' in output and "/login" in output
-    assert "test-data-token" not in output + str(error.value)
-    assert "hidden-query" not in output
-
-
-def test_redirect_loop_has_a_limit_and_keeps_diagnostics(post_script, redirect_transport, capsys):
-    responses, sent = redirect_transport
-    responses.extend([{"status": 302, "location": "/loop?token=hidden-query"}] * 40)
-    with pytest.raises(ValueError, match="TooManyRedirects"):
-        post_script.post_payload({}, "test-data-token")
-    assert len(sent) == 31
-    output = capsys.readouterr().out
-    assert output.count("HTTP 诊断：") == len(sent)
-    assert "hidden-query" not in output and "test-data-token" not in output
-
-
-def test_http_diagnostics_do_not_log_credentials_cookies_body_or_control_lines(post_script, capsys):
+def test_http_diagnostics_do_not_log_credentials_cookies_body_or_control_lines(post_script, api_client, capsys):
     response = post_response(status=302, location="https://user:password@login.example.test/login?ticket=hidden-query#hidden-fragment",
                              content_type="text/html\r\n::error::forged; charset=UTF-8")
     response.headers["Set-Cookie"] = "session=hidden-cookie"
     response._content = b"hidden-response-body"
-    post_script.log_http_response(response, "test-data-token")
-    output = capsys.readouterr().out
-    assert len(output.splitlines()) == 1
-    assert "https://login.example.test/login" in output
-    assert "\\r\\n" in output
-    for secret in ("test-data-token", "user:password", "hidden-query", "hidden-fragment",
-                   "hidden-cookie", "hidden-response-body"):
-        assert secret not in output
+    post_script.requests.post.return_value = response
+    with pytest.raises(ValueError, match="HTTP 302"):
+        api_client.save_artifact({})
+    assert capsys.readouterr().out == "发布数据接口响应：HTTP 302\n"
 
 
-@pytest.mark.parametrize("url,expected", [
-    ("https://user:password@example.test:8443/api?ticket=secret#fragment", "https://example.test:8443/api"),
-    ("https://example.test/test-data-token/api", "https://example.test/[REDACTED]/api"),
-    ("https://[::1]:8443/api?ticket=secret", "https://[::1]:8443/api"),
-    ("https://[bad/api?ticket=secret", "[无法解析的 URL]"),
-    ("", ""),
+def test_open_api_encrypts_unicode_and_signs_exact_body(post_script, api_client, decode_request, monkeypatch):
+    monkeypatch.setattr(post_script.time, "time", lambda: 1700000000.123)
+    payload = {"item": "测试包", "nested": {"value": ["数据", 1]}}
+    original = json.dumps(payload)
+    response = api_client.save_artifact(payload)
+    call = post_script.requests.post.call_args
+    assert response is post_script.requests.post.return_value
+    assert call.kwargs["headers"]["X-Open-Timestamp"] == "1700000000123"
+    assert decode_request(call) == payload
+    assert "测试包".encode("utf-8") not in call.kwargs["data"]
+    assert json.dumps(payload) == original
+
+
+def test_open_api_uses_fresh_encryption_for_each_request(post_script, api_client, decode_request):
+    payload = {"item": "demo_package"}
+    api_client.save_artifact(payload)
+    api_client.save_artifact(payload)
+    first, second = post_script.requests.post.call_args_list
+    assert decode_request(first) == decode_request(second) == payload
+    first_envelope, second_envelope = (json.loads(call.kwargs["data"]) for call in (first, second))
+    assert all(first_envelope[name] != second_envelope[name] for name in ("iv", "encKey", "cipher"))
+
+
+@pytest.mark.parametrize("name", ["SERVER_PUBLIC_KEY_B64", "CLIENT_PRIVATE_KEY_B64"])
+@pytest.mark.parametrize("value", ["not-base64!", "bm90LWEtZGVyLWtleQ=="])
+def test_open_api_rejects_invalid_keys_without_logging_values(
+    post_script, open_api_env, monkeypatch, capsys, name, value
+):
+    set_open_api_value(post_script, monkeypatch, name, value)
+    with pytest.raises(ValueError, match="密钥加载失败") as error:
+        post_script.OpenApiClient(post_script.OpenApiConfig.from_env())
+    output = capsys.readouterr()
+    assert value not in str(error.value) + output.out + output.err
+    post_script.requests.post.assert_not_called()
+
+
+@pytest.mark.parametrize("name", ["SERVER_PUBLIC_KEY_B64", "CLIENT_PRIVATE_KEY_B64"])
+def test_open_api_rejects_non_rsa_keys(post_script, open_api_env, monkeypatch, name):
+    key = ec.generate_private_key(ec.SECP256R1())
+    if name == "SERVER_PUBLIC_KEY_B64":
+        der = key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    else:
+        der = key.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    set_open_api_value(post_script, monkeypatch, name, base64.b64encode(der).decode("ascii"))
+    with pytest.raises(ValueError, match="必须是 RSA 密钥"):
+        post_script.OpenApiClient(post_script.OpenApiConfig.from_env())
+    post_script.requests.post.assert_not_called()
+
+
+@pytest.mark.parametrize("url", [
+    "ftp://example.test", "https:///missing-host", "https://user:password@example.test",
+    "https://example.test/prefix", "https://example.test?token=secret", "https://example.test#fragment",
+    "https://[bad", "https://example.test:bad", "https://example.test:65536",
 ])
-def test_diagnostic_url_removes_sensitive_parts(post_script, url, expected):
-    assert post_script.diagnostic_url(url, "test-data-token") == expected
+def test_open_api_rejects_invalid_base_url(post_script, open_api_env, monkeypatch, url):
+    monkeypatch.setattr(post_script, "OPEN_API_BASE_URL", url)
+    with pytest.raises(ValueError, match="OPEN_API_BASE_URL"):
+        post_script.OpenApiClient(post_script.OpenApiConfig.from_env())
+    post_script.requests.post.assert_not_called()
+
+
+@pytest.mark.parametrize("url", ["https://api.example.test/", "http://127.0.0.1:7000", "http://[::1]:7000/"])
+def test_open_api_builds_url_from_origin(post_script, open_api_env, monkeypatch, url, decode_request):
+    monkeypatch.setattr(post_script, "OPEN_API_BASE_URL", url)
+    client = post_script.OpenApiClient(post_script.OpenApiConfig.from_env())
+    client.save_artifact({})
+    call = post_script.requests.post.call_args
+    assert call.args == (url.rstrip("/") + "/open/flyingTiger/synchronize/artifact/save",)
+    assert decode_request(call) == {}
+
+
+@pytest.mark.parametrize("env_value", [None, "ignored-environment-value"])
+def test_open_api_public_settings_only_use_script_constants(
+    post_script, open_api_env, monkeypatch, env_value
+):
+    names = {
+        "OPEN_API_BASE_URL": "base_url", "OPEN_API_CLIENT_ID": "client_id",
+        "SERVER_PUBLIC_KEY_B64": "server_public_key_b64",
+    }
+    for name in names:
+        if env_value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, env_value)
+    config = post_script.OpenApiConfig.from_env()
+    config.validate()
+    for name, attribute in names.items():
+        assert getattr(config, attribute) == getattr(post_script, name) == open_api_env[name]
+    assert config.client_private_key_b64 == os.environ["CLIENT_PRIVATE_KEY_B64"]
+
+
+def test_open_api_config_repr_does_not_expose_keys(post_script, open_api_env):
+    config = post_script.OpenApiConfig.from_env()
+    assert config.server_public_key_b64 == open_api_env["SERVER_PUBLIC_KEY_B64"]
+    assert config.client_private_key_b64 == open_api_env["CLIENT_PRIVATE_KEY_B64"]
+    assert config.server_public_key_b64 not in repr(config)
+    assert config.client_private_key_b64 not in repr(config)
 
 
 @pytest.mark.parametrize("bad_data,error", [
@@ -630,11 +775,16 @@ def test_post_unsupported_os_blocks_all_requests(post_script, post_workspace, re
     post_script.requests.post.assert_not_called()
 
 
-@pytest.mark.parametrize("token", ["", " ", "token\n", "token\rvalue", " token"])
-def test_post_requires_valid_secret_before_requests(post_script, post_workspace, release_record, monkeypatch, token):
-    monkeypatch.setenv("DATA_TOKEN", token)
+@pytest.mark.parametrize("name", [
+    "OPEN_API_BASE_URL", "OPEN_API_CLIENT_ID", "SERVER_PUBLIC_KEY_B64", "CLIENT_PRIVATE_KEY_B64",
+])
+@pytest.mark.parametrize("value", [None, "", " ", "value\n", "value\rdata", " value", "<placeholder>"])
+def test_post_requires_valid_config_before_requests(
+    post_script, post_workspace, release_record, monkeypatch, name, value
+):
+    set_open_api_value(post_script, monkeypatch, name, value)
     (post_workspace / "release-data/release-0.json").write_text(json.dumps(release_record))
-    with pytest.raises(ValueError, match="data_token"):
+    with pytest.raises(ValueError, match=name):
         post_script.main(["--input-dir", "release-data"])
     post_script.requests.post.assert_not_called()
 

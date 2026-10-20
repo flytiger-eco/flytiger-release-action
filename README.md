@@ -41,10 +41,14 @@ The caller's repository requires:
 | --- | --- | --- |
 | `release_username` | Yes | Artifactory release username |
 | `release_token` | Yes | Artifactory release credential |
-| `data_token` | Yes | Complete `Authorization` header value for the release data API; the script does not automatically add the `Bearer` prefix |
+| `data_token` | Yes | 客户端 RSA 私钥，Base64 编码的未加密 DER 格式（PKCS8）|
 | `template_token` | No | Read-only token for checking out a private template repository; falls back to `github.token` if omitted |
 
-The example below maps the caller's `RELEASE_USERNAME`, `RELEASE_TOKEN`, and `DATA_TOKEN` Secrets to the corresponding workflow parameters. Do not put credentials in YAML or build commands. Private template repositories must also allow cross-repository calls in their Actions settings.
+下方示例将调用方的大写 Secrets 映射到对应的工作流参数。不要将凭据写入 YAML 或构建命令。私有模板仓库还需在 Actions 设置中允许跨仓库调用。
+
+发布数据使用 `/open/sync/artifact/save`，通过 AES-256-GCM 加密业务数据、RSA-OAEP-SHA256 加密 AES 密钥，并使用 RSA-SHA256 签名。工作流保留 `data_token` Secret 名称，其值为客户端 RSA 私钥；工作流将其映射到 `CLIENT_PRIVATE_KEY_B64` 环境变量。直接运行脚本时也通过该环境变量传入私钥。
+
+在 `.github/scripts/post_data.py` 顶部直接填写 `OPEN_API_BASE_URL`、`OPEN_API_CLIENT_ID` 和 `SERVER_PUBLIC_KEY_B64` 三个常量；同名环境变量不生效。地址仅含协议、主机及可选端口，生产环境使用 HTTPS；公钥为 Base64 编码的 DER 格式（SubjectPublicKeyInfo）。这三个值当前为空，使用前必须填写，并通过 `template_ref` 引用已配置的脚本版本。私钥不得写入脚本。
 
 ### 2. Add a Workflow to the Caller
 
@@ -234,7 +238,7 @@ Run the following from the repository root (if `.venv` already exists, check its
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install --no-input pytest PyYAML packaging setuptools wheel requests
+python -m pip install --no-input pytest PyYAML packaging setuptools wheel requests cryptography
 PYTHONDONTWRITEBYTECODE=1 python -m pytest .github/tests -q -p no:cacheprovider
 ```
 
